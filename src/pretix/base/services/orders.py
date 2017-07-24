@@ -24,6 +24,7 @@ from pretix.base.models import (
 )
 from pretix.base.models.event import SubEvent
 from pretix.base.models.orders import CachedTicket, InvoiceAddress
+from pretix.base.models.tax import TaxedPrice
 from pretix.base.payment import BasePaymentProvider
 from pretix.base.reldate import RelativeDateWrapper
 from pretix.base.services.async import ProfiledTask
@@ -552,7 +553,8 @@ class OrderChangeManager:
         if (not variation and item.has_variations) or (variation and variation.item_id != item.pk):
             raise OrderError(self.error_messages['product_without_variation'])
 
-        price = get_price(item, variation, voucher=position.voucher, subevent=position.subevent)
+        price = get_price(item, variation, voucher=position.voucher, subevent=position.subevent,
+                          invoice_address=self._invoice_address)
 
         if price is None:  # NOQA
             raise OrderError(self.error_messages['product_invalid'])
@@ -562,7 +564,7 @@ class OrderChangeManager:
         if not new_quotas:
             raise OrderError(self.error_messages['quota_missing'])
 
-        if self.order.event.settings.invoice_include_free or price != Decimal('0.00') or position.price != Decimal('0.00'):
+        if self.order.event.settings.invoice_include_free or price.gross != Decimal('0.00') or position.price != Decimal('0.00'):
             self._invoice_dirty = True
 
         self._totaldiff = price.gross - position.price
@@ -571,7 +573,8 @@ class OrderChangeManager:
         self._operations.append(self.ItemOperation(position, item, variation, price))
 
     def change_subevent(self, position: OrderPosition, subevent: SubEvent):
-        price = get_price(position.item, position.variation, voucher=position.voucher, subevent=subevent)
+        price = get_price(position.item, position.variation, voucher=position.voucher, subevent=subevent,
+                          invoice_address=self._invoice_address)
 
         if price is None:  # NOQA
             raise OrderError(self.error_messages['product_invalid'])
@@ -581,7 +584,7 @@ class OrderChangeManager:
         if not new_quotas:
             raise OrderError(self.error_messages['quota_missing'])
 
-        if self.order.event.settings.invoice_include_free or price != Decimal('0.00') or position.price != Decimal('0.00'):
+        if self.order.event.settings.invoice_include_free or price.gross != Decimal('0.00') or position.price != Decimal('0.00'):
             self._invoice_dirty = True
 
         self._totaldiff = price.gross - position.price
@@ -590,9 +593,11 @@ class OrderChangeManager:
         self._operations.append(self.SubeventOperation(position, subevent, price))
 
     def change_price(self, position: OrderPosition, price: Decimal):
-        self._totaldiff = price - position.price
+        price = position.item.tax(price)
 
-        if self.order.event.settings.invoice_include_free or price != Decimal('0.00') or position.price != Decimal('0.00'):
+        self._totaldiff = price.gross - position.price
+
+        if self.order.event.settings.invoice_include_free or price.gross != Decimal('0.00') or position.price != Decimal('0.00'):
             self._invoice_dirty = True
 
         self._operations.append(self.PriceOperation(position, price))
@@ -608,7 +613,13 @@ class OrderChangeManager:
     def add_position(self, item: Item, variation: ItemVariation, price: Decimal, addon_to: Order = None,
                      subevent: SubEvent = None):
         if price is None:
-            price = get_price(item, variation, subevent=subevent)
+            price = get_price(item, variation, subevent=subevent, invoice_address=self._invoice_address)
+        else:
+            if item.tax_rule.tax_applicable(self._invoice_address):
+                price = item.tax(price, base_price_is='gross')
+            else:
+                price = TaxedPrice(gross=price, net=price, tax=Decimal('0.00'), rate=Decimal('0.00'), name='')
+
         if price is None:
             raise OrderError(self.error_messages['product_invalid'])
         if not addon_to and item.category and item.category.is_addon:
@@ -624,10 +635,10 @@ class OrderChangeManager:
         if not new_quotas:
             raise OrderError(self.error_messages['quota_missing'])
 
-        if self.order.event.settings.invoice_include_free or price != Decimal('0.00'):
+        if self.order.event.settings.invoice_include_free or price.gross != Decimal('0.00'):
             self._invoice_dirty = True
 
-        self._totaldiff = price
+        self._totaldiff = price.gross
         self._quotadiff.update(new_quotas)
         self._operations.append(self.AddOperation(item, variation, price, addon_to, subevent))
 
@@ -671,8 +682,10 @@ class OrderChangeManager:
                 })
                 op.position.item = op.item
                 op.position.variation = op.variation
-                op.position.price = op.price
-                op.position._calculate_tax()
+                op.position.price = op.price.gross
+                op.position.tax_rate = op.price.rate
+                op.position.tax_value = op.price.tax
+                op.position.tax_rule = op.item.tax_rule
                 op.position.save()
             elif isinstance(op, self.SubeventOperation):
                 self.order.log_action('pretix.event.order.changed.subevent', user=self.user, data={
@@ -681,11 +694,13 @@ class OrderChangeManager:
                     'old_subevent': op.position.subevent.pk,
                     'new_subevent': op.subevent.pk,
                     'old_price': op.position.price,
-                    'new_price': op.price
+                    'new_price': op.price.gross
                 })
                 op.position.subevent = op.subevent
-                op.position.price = op.price
-                op.position._calculate_tax()
+                op.position.price = op.price.gross
+                op.position.tax_rate = op.price.rate
+                op.position.tax_value = op.price.tax
+                op.position.tax_rule = op.position.item.tax_rule
                 op.position.save()
             elif isinstance(op, self.PriceOperation):
                 self.order.log_action('pretix.event.order.changed.price', user=self.user, data={
@@ -695,8 +710,10 @@ class OrderChangeManager:
                     'addon_to': op.position.addon_to_id,
                     'new_price': op.price.gross
                 })
-                op.position.price = op.price
-                op.position._calculate_tax()
+                op.position.price = op.price.gross
+                op.position.tax_rate = op.price.rate
+                op.position.tax_value = op.price.tax
+                op.position.tax_rule = op.position.item.tax_rule
                 op.position.save()
             elif isinstance(op, self.CancelOperation):
                 for opa in op.position.addons.all():
@@ -720,7 +737,8 @@ class OrderChangeManager:
             elif isinstance(op, self.AddOperation):
                 pos = OrderPosition.objects.create(
                     item=op.item, variation=op.variation, addon_to=op.addon_to,
-                    price=op.price, order=self.order,
+                    price=op.price.gross, order=self.order, tax_rate=op.price.rate,
+                    tax_value=op.price.tax, tax_rule=op.item.tax_rule,
                     positionid=nextposid, subevent=op.subevent
                 )
                 nextposid += 1
@@ -729,7 +747,7 @@ class OrderChangeManager:
                     'item': op.item.pk,
                     'variation': op.variation.pk if op.variation else None,
                     'addon_to': op.addon_to.pk if op.addon_to else None,
-                    'price': op.price,
+                    'price': op.price.gross,
                     'positionid': pos.positionid,
                     'subevent': op.subevent.pk if op.subevent else None,
                 })
@@ -756,6 +774,13 @@ class OrderChangeManager:
         cancels = len([o for o in self._operations if isinstance(o, self.CancelOperation)])
         if cancels == self.order.positions.count():
             raise OrderError(self.error_messages['complete_cancel'])
+
+    @property
+    def _invoice_address(self):
+        try:
+            return self.order.invoice_address
+        except InvoiceAddress.DoesNotExist:
+            return None
 
     def _notify_user(self):
         with language(self.order.locale):
